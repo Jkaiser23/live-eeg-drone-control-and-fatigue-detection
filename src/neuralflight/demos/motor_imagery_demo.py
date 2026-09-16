@@ -141,7 +141,7 @@ def main():
     if not model_path.exists():
         print()
         print("ERROR: Model not found!")
-        print("Please run 'python demos/train_model.py' first to train the model.")
+        print("Please run 'neuralflight-train' first to train the model.")
         print()
         simulator.close()
         return

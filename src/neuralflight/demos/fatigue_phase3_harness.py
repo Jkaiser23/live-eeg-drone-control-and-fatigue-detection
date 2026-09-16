@@ -16,23 +16,19 @@ Two fault-injection phases are scripted so you can watch escalation live:
   - t=8s:    drone "link" is forced down for a few ticks -> expect instant LAND
   - t=8s+:   vision worker goes silent -> expect HOVER then LAND (face-lost)
 
-Run: python demos/fatigue_phase3_harness.py
+Run: python -m neuralflight.demos.fatigue_phase3_harness
 Stop: Ctrl+C or close the simulator window
 """
 
-import sys
 import time
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
-from neuralflight.controllers.drone_controller import DroneController  # noqa: E402
-from neuralflight.fatigue.fusion import compute_fatigue_index  # noqa: E402
-from neuralflight.fatigue.mock_workers import MockEEGWorker, MockVisionWorker  # noqa: E402
-from neuralflight.fatigue.safety import SafetyAction, SafetyMonitor  # noqa: E402
-from neuralflight.fatigue.shared_state import SharedFatigueState  # noqa: E402
-from neuralflight.simulator.drone_sim import DroneSimulator  # noqa: E402
-from neuralflight.utils.config_loader import load_config  # noqa: E402
+from neuralflight.controllers.drone_controller import DroneController
+from neuralflight.fatigue.fusion import compute_fatigue_index
+from neuralflight.fatigue.mock_workers import MockEEGWorker, MockVisionWorker
+from neuralflight.fatigue.safety import SafetyAction, SafetyMonitor
+from neuralflight.fatigue.shared_state import SharedFatigueState
+from neuralflight.simulator.drone_sim import DroneSimulator
+from neuralflight.utils.config_loader import load_config
 
 TICK_HZ = 20.0
 TICK_S = 1.0 / TICK_HZ

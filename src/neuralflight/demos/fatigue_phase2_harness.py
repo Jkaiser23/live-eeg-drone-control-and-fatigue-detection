@@ -7,19 +7,15 @@ confidence react live as the mock workers agree, disagree, degrade, or go
 silent -- on top of the scripted, exact-number scenarios in
 tests/test_fusion.py.
 
-Run: python demos/fatigue_phase2_harness.py
+Run: python -m neuralflight.demos.fatigue_phase2_harness
 Stop: Ctrl+C
 """
 
-import sys
 import time
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
-from neuralflight.fatigue.fusion import compute_fatigue_index  # noqa: E402
-from neuralflight.fatigue.mock_workers import MockEEGWorker, MockVisionWorker  # noqa: E402
-from neuralflight.fatigue.shared_state import SharedFatigueState  # noqa: E402
+from neuralflight.fatigue.fusion import compute_fatigue_index
+from neuralflight.fatigue.mock_workers import MockEEGWorker, MockVisionWorker
+from neuralflight.fatigue.shared_state import SharedFatigueState
 
 TICK_HZ = 5.0
 TICK_S = 1.0 / TICK_HZ

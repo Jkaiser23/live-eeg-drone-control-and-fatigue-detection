@@ -318,7 +318,7 @@ def main():
         / config["training"]["savename"]
     )
     print(f"\nModel saved to: {save_path}")
-    print("Run 'python demos/motor_imagery_demo.py' to test it!")
+    print("Run 'neuralflight-eeg' to test it!")
 
 
 if __name__ == "__main__":

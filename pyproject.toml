@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=65.0", "wheel"]
+requires = ["setuptools>=77.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,7 @@ version = "2.0.0"
 description = "Neural control framework for drones with computer vision and brain signals"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 authors = [
     {name = "Saumya Saksena", email = "kumaar324@gmail.com"}
 ]
@@ -16,7 +16,6 @@ keywords = ["bci", "eeg", "drone", "pytorch", "machine-learning", "neuroscience"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -38,13 +37,22 @@ dependencies = [
     "tqdm>=4.65.0",
 ]
 
+[project.scripts]
+neuralflight-hand = "neuralflight.demos.hand_gesture_demo:main"
+neuralflight-head = "neuralflight.demos.head_gesture_demo:main"
+neuralflight-eeg = "neuralflight.demos.motor_imagery_demo:main"
+neuralflight-train = "neuralflight.demos.train_model:main"
+
 [project.optional-dependencies]
 dev = [
+    "pytest>=7.0.0",
     "ruff>=0.1.0",
     "pre-commit>=3.5.0",
     "jupyter>=1.0.0",
     "ipykernel>=6.25.0",
 ]
+eeg = ["brainflow>=5.0.0"]
+codrone = ["codrone-edu"]
 
 [project.urls]
 Homepage = "https://github.com/dronefreak/NeuralFlight"
@@ -58,7 +66,7 @@ where = ["src"]
 [tool.ruff]
 line-length = 88
 target-version = "py310"
-src = ["src", "demos", "tests"]
+src = ["src", "tests"]
 
 select = [
     "E",   # pycodestyle errors
@@ -87,3 +95,6 @@ lines-after-imports = 2
 quote-style = "double"
 indent-style = "space"
 line-ending = "auto"
+
+[tool.pytest.ini_options]
+python_functions = ["test_*", "scenario_*"]

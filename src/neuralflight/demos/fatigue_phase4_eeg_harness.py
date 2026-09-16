@@ -11,20 +11,16 @@ Swapping to real hardware later is a config change, not a code change:
 set board_id=BoardIds.CYTON_DAISY_BOARD and serial_port to the actual
 device path.
 
-Run: python demos/fatigue_phase4_eeg_harness.py
+Run: python -m neuralflight.demos.fatigue_phase4_eeg_harness
 Stop: Ctrl+C
 """
 
-import sys
 import time
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+from brainflow.board_shim import BoardIds, BoardShim
 
-from brainflow.board_shim import BoardIds, BoardShim  # noqa: E402
-
-from neuralflight.fatigue.eeg_worker import EEGWorker, EEGWorkerConfig  # noqa: E402
-from neuralflight.fatigue.shared_state import SharedFatigueState  # noqa: E402
+from neuralflight.fatigue.eeg_worker import EEGWorker, EEGWorkerConfig
+from neuralflight.fatigue.shared_state import SharedFatigueState
 
 RUN_SECONDS = 12.0
 POLL_INTERVAL_S = 1.0

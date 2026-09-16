@@ -13,19 +13,14 @@ of it:
   3. The vision mock goes silent after a fixed delay -- confirms staleness
      (timestamp) is detectable independently of quality.
 
-Run: python demos/fatigue_phase1_harness.py
+Run: python -m neuralflight.demos.fatigue_phase1_harness
 Stop: Ctrl+C
 """
 
-import sys
 import time
-from pathlib import Path
 
-# Allow running directly from a repo checkout without `pip install -e .`
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
-from neuralflight.fatigue.mock_workers import MockEEGWorker, MockVisionWorker  # noqa: E402
-from neuralflight.fatigue.shared_state import SharedFatigueState  # noqa: E402
+from neuralflight.fatigue.mock_workers import MockEEGWorker, MockVisionWorker
+from neuralflight.fatigue.shared_state import SharedFatigueState
 
 TICK_HZ = 5.0  # slow tick is fine here -- this harness is for eyeballing, not real-time control
 TICK_S = 1.0 / TICK_HZ
