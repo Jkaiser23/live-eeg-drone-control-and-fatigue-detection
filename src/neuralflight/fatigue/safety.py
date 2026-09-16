@@ -6,7 +6,7 @@ flag. Checks run in STRICT priority order and the first one that fires wins
 -- results are never blended. This mirrors the "Detected State -> System
 Response" table from the project brief:
 
-  1. drone link lost         -> LAND immediately (near-instant, no grace)
+  1. drone link lost         -> EMERGENCY_STOP immediately (near-instant, no grace)
   2. both modalities stale   -> LAND (after brief grace) -- total data loss
   3. face lost (vision only) -> LAND (after grace) -- vision specifically gone
   4. sustained high fatigue  -> LAND (after grace) -- fatigue_index >= hard limit
@@ -35,6 +35,7 @@ class SafetyAction(Enum):
     REDUCE_SPEED = "reduce_speed"  # execute, but the caller should throttle intensity
     HOVER = "hover"  # suppress new commands, hold position
     LAND = "land"  # force immediate landing
+    EMERGENCY_STOP = "emergency_stop"  # bypass controller state and hard-stop backend
 
 
 @dataclass
@@ -104,9 +105,11 @@ class SafetyMonitor:
         t = self.thresholds
 
         # 1. Hardware link check -- highest priority, effectively no grace.
+        # A dead link invalidates controller flight-state telemetry, so this
+        # deliberately uses the backend's unconditional hard-stop path.
         link_streak = self._link_lost_counter.update(not drone_link_ok)
         if link_streak >= t.link_lost_land_ticks:
-            return SafetyDecision(SafetyAction.LAND, "drone_link_lost", fatigue_result)
+            return SafetyDecision(SafetyAction.EMERGENCY_STOP, "drone_link_lost", fatigue_result)
 
         # 2. Total data staleness -- both modalities gone (fusion already says so).
         both_stale = fatigue_result.mode == "no_data"

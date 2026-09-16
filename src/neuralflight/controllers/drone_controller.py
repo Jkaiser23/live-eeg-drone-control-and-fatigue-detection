@@ -67,8 +67,19 @@ class DroneController:
         self.move(DroneCommand.HOVER.value)
 
     def emergency_stop(self):
-        """Emergency stop - immediately land."""
-        self.land()
+        """Immediately stop the backend, regardless of local flight state.
+
+        ``_is_flying`` is only a controller-side cache and cannot be trusted
+        during a hardware or telemetry failure.  A hard-stop request must
+        therefore always reach the backend.
+        """
+        emergency_stop = getattr(self.drone, "emergency_stop", None)
+        if callable(emergency_stop):
+            emergency_stop()
+        else:
+            # Compatibility path for older backends without a hard-stop API.
+            self.drone.send_command(DroneCommand.LAND.value, 1.0)
+        self._is_flying = False
 
     @property
     def is_flying(self) -> bool:

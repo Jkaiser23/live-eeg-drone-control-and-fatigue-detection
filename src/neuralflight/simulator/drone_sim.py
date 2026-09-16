@@ -238,6 +238,11 @@ class DroneSimulator:
         self.state.velocity_x = 0
         self.state.velocity_y = 0
 
+    def emergency_stop(self):
+        """Immediately stop movement and mark the simulated drone landed."""
+        self.current_command = ("hover", 0.0)
+        self.land()
+
     def close(self):
         """Clean up resources."""
         pygame.quit()

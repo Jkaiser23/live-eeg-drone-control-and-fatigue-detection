@@ -13,8 +13,9 @@ simulator blocking sensor updates (or vice versa).
 
 Two fault-injection phases are scripted so you can watch escalation live:
   - t=0-8s:  normal operation, occasional EEG NaN blips (from Phase 1/2)
-  - t=8s:    drone "link" is forced down for a few ticks -> expect instant LAND
-  - t=8s+:   vision worker goes silent -> expect HOVER then LAND (face-lost)
+  - t=8s:    drone "link" is forced down for a few ticks -> expect immediate emergency stop
+  - t=8s+:   vision worker stays alive but publishes failed camera reads ->
+             expect HOVER then LAND (face-lost)
 
 Run: python -m neuralflight.demos.fatigue_phase3_harness
 Stop: Ctrl+C or close the simulator window
@@ -34,7 +35,7 @@ TICK_HZ = 20.0
 TICK_S = 1.0 / TICK_HZ
 
 EEG_FAIL_PROBABILITY = 0.1
-VISION_SILENT_AFTER_S = 8.0  # simulate face lost partway through the run
+VISION_FAILURE_AFTER_S = 8.0  # simulate cap.read() failing forever while worker remains alive
 LINK_DOWN_START_S = 8.0  # simulate a dropped drone link at the same time, briefly
 LINK_DOWN_DURATION_S = 0.3  # short glitch -- long enough to prove LAND is near-instant
 
@@ -49,13 +50,13 @@ def main() -> None:
     safety = SafetyMonitor()
 
     eeg_worker = MockEEGWorker(state, interval_s=0.4, fail_probability=EEG_FAIL_PROBABILITY)
-    vision_worker = MockVisionWorker(state, interval_s=0.2, silent_after_s=VISION_SILENT_AFTER_S)
+    vision_worker = MockVisionWorker(state, interval_s=0.2, invalid_after_s=VISION_FAILURE_AFTER_S)
     eeg_worker.start()
     vision_worker.start()
 
     print("Phase 3 harness running against the real DroneSimulator.")
-    print(f"  Vision worker goes silent at t={VISION_SILENT_AFTER_S:.0f}s (expect HOVER then LAND)")
-    print(f"  Drone link forced down at t={LINK_DOWN_START_S:.0f}s for {LINK_DOWN_DURATION_S}s (expect instant LAND)")
+    print(f"  Vision reads fail from t={VISION_FAILURE_AFTER_S:.0f}s while worker stays alive (expect HOVER then LAND)")
+    print(f"  Drone link forced down at t={LINK_DOWN_START_S:.0f}s for {LINK_DOWN_DURATION_S}s (expect emergency stop)")
     print("  Ctrl+C or close the window to stop.\n")
 
     start_time = time.monotonic()
@@ -74,7 +75,9 @@ def main() -> None:
             fatigue_result = compute_fatigue_index(snapshot, now=tick_start)
             decision = safety.evaluate(snapshot, fatigue_result, now=tick_start, drone_link_ok=drone_link_ok)
 
-            if decision.action == SafetyAction.LAND:
+            if decision.action == SafetyAction.EMERGENCY_STOP:
+                controller.emergency_stop()
+            elif decision.action == SafetyAction.LAND:
                 controller.land()
             elif decision.action == SafetyAction.HOVER:
                 controller.hover()

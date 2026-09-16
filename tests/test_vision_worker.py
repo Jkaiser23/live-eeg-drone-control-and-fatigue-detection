@@ -14,9 +14,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from neuralflight.fatigue.vision_worker import (  # noqa: E402
+    VisionWorker,
+    VisionWorkerConfig,
     eye_aspect_ratio,
     summarize_window,
 )
+from neuralflight.fatigue.shared_state import SharedFatigueState  # noqa: E402
 
 
 def check(name: str, condition: bool, detail: str = "") -> None:
@@ -91,6 +94,23 @@ def scenario_empty_window_is_safe():
     check("empty_window: quality is 0.0", quality == 0.0)
 
 
+def scenario_failed_reads_are_hard_capped_even_with_identical_timestamps():
+    """A camera that fails faster than monotonic time advances cannot grow history forever."""
+    state = SharedFatigueState()
+    worker = VisionWorker(
+        state,
+        VisionWorkerConfig(max_history_len=3, update_interval_s=0.0),
+    )
+
+    for _ in range(20):
+        worker._record_sample(1000.0, None)
+
+    check("failed_reads: history respects configured cap", len(worker._history) == 3)
+    worker._publish_if_due(1000.0, 0.0)
+    snapshot = state.snapshot()
+    check("failed_reads: published quality is 0.0", snapshot.vision.quality == 0.0)
+
+
 def main() -> None:
     scenarios = [
         scenario_open_eye_has_high_ear,
@@ -101,6 +121,7 @@ def main() -> None:
         scenario_mixed_perclos_and_partial_quality,
         scenario_no_face_ever_detected_gives_none_and_zero_quality,
         scenario_empty_window_is_safe,
+        scenario_failed_reads_are_hard_capped_even_with_identical_timestamps,
     ]
     print(f"Running {len(scenarios)} vision scoring scenarios...\n")
     for scenario in scenarios:

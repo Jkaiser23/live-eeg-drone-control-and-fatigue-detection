@@ -11,7 +11,7 @@ Unlike Phase 3's harness, `drone_link_ok` here comes from the REAL
 CoDroneWorker.link_status(), not a scripted glitch -- if no CoDrone EDU
 dongle is attached, this demonstrates the intended fail-safe behavior for
 that exact situation: the link never comes up, so the safety chain should
-issue LAND from the very first tick and keep issuing it, rather than ever
+issue an emergency stop from the very first tick and keep issuing it, rather than ever
 allowing a takeoff/move command through.
 
 Run: python -m neuralflight.fatigue.fatigue_phase5_codrone_harness
@@ -46,7 +46,7 @@ def main() -> None:
     vision_worker.start()
 
     print("Phase 5 harness running against the REAL CoDroneWorker.")
-    print("If no CoDrone EDU dongle is attached, expect LAND from tick 1 onward --")
+    print("If no CoDrone EDU dongle is attached, expect EMERGENCY_STOP from tick 1 onward --")
     print("that IS the correct fail-safe behavior for an unreachable drone.\n")
 
     controller.takeoff()  # queued -- CoDroneWorker will refuse to act meaningfully if never connected
@@ -65,7 +65,9 @@ def main() -> None:
             fatigue_result = compute_fatigue_index(snapshot, now=tick_start)
             decision = safety.evaluate(snapshot, fatigue_result, now=tick_start, drone_link_ok=drone_link_ok)
 
-            if decision.action == SafetyAction.LAND:
+            if decision.action == SafetyAction.EMERGENCY_STOP:
+                controller.emergency_stop()
+            elif decision.action == SafetyAction.LAND:
                 controller.land()
             elif decision.action == SafetyAction.HOVER:
                 controller.hover()

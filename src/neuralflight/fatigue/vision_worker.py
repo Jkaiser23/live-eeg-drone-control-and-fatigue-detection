@@ -60,6 +60,8 @@ class VisionWorkerConfig:
     update_interval_s: float = 0.5
     min_detection_confidence: float = 0.5
     min_tracking_confidence: float = 0.5
+    max_consecutive_failures: int = 10
+    max_history_len: int = 600
 
 
 def _euclidean(p: Tuple[float, float], q: Tuple[float, float]) -> float:
@@ -112,6 +114,10 @@ class VisionWorker(threading.Thread):
         super().__init__(name="VisionWorker", daemon=True)
         if not _VISION_DEPS_AVAILABLE:
             raise ImportError("opencv-python and mediapipe are required -- pip install opencv-python mediapipe")
+        if config.max_consecutive_failures < 1:
+            raise ValueError("max_consecutive_failures must be at least 1")
+        if config.max_history_len < 1:
+            raise ValueError("max_history_len must be at least 1")
 
         self._state = state
         self._config = config
@@ -137,25 +143,50 @@ class VisionWorker(threading.Thread):
         )
 
         last_publish = time.monotonic()
+        consecutive_failures = 0
         try:
             while not self._stop_event.is_set():
                 ret, frame = cap.read()
                 now = time.monotonic()
 
-                ear = None
-                if ret and frame is not None:
-                    ear = self._safe_process_frame(frame, face_mesh)
+                if not ret or frame is None:
+                    consecutive_failures += 1
+                    self._record_sample(now, None)
+                    last_publish = self._publish_if_due(now, last_publish)
 
-                self._history.append((now, ear))
-                self._trim_window(now)
+                    if consecutive_failures == cfg.max_consecutive_failures:
+                        logger.error(
+                            "VisionWorker: camera unresponsive after %d reads; publishing quality=0.0",
+                            consecutive_failures,
+                        )
+                        self._state.update_vision(None, 0.0)
 
-                if now - last_publish >= cfg.update_interval_s:
-                    score, quality = summarize_window(list(self._history), cfg.ear_closed_threshold)
-                    self._state.update_vision(score, quality)
-                    last_publish = now
+                    # Event.wait, unlike sleep, lets stop() interrupt a backoff promptly.
+                    backoff_s = min(0.5, 0.05 * consecutive_failures)
+                    self._stop_event.wait(backoff_s)
+                    continue
+
+                consecutive_failures = 0
+                self._record_sample(now, self._safe_process_frame(frame, face_mesh))
+                last_publish = self._publish_if_due(now, last_publish)
         finally:
             cap.release()
             face_mesh.close()
+
+    def _record_sample(self, now: float, ear: Optional[float]) -> None:
+        """Store one frame result while enforcing both time and count bounds."""
+        self._history.append((now, ear))
+        self._trim_window(now)
+        while len(self._history) > self._config.max_history_len:
+            self._history.popleft()
+
+    def _publish_if_due(self, now: float, last_publish: float) -> float:
+        """Publish the current rolling-window summary at the configured cadence."""
+        if now - last_publish < self._config.update_interval_s:
+            return last_publish
+        score, quality = summarize_window(list(self._history), self._config.ear_closed_threshold)
+        self._state.update_vision(score, quality)
+        return now
 
     def _trim_window(self, now: float) -> None:
         cutoff = now - self._config.window_seconds

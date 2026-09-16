@@ -10,6 +10,8 @@ you exercise the failure paths the contract is designed to handle:
   worker producing a bad reading while still running normally).
 - silent_after_s: if set, the worker stops calling update_* entirely after
   this many seconds (simulates a hung/dead sensor thread).
+- invalid_after_s: if set, the worker remains alive but publishes no data
+  with quality=0.0 (simulates a camera whose reads fail forever).
 """
 
 from __future__ import annotations
@@ -36,12 +38,14 @@ class _MockWorker(threading.Thread):
         name: str = "MockWorker",
         fail_probability: float = 0.0,
         silent_after_s: Optional[float] = None,
+        invalid_after_s: Optional[float] = None,
     ) -> None:
         super().__init__(name=name, daemon=True)
         self._update_fn = update_fn
         self._interval_s = interval_s
         self._fail_probability = fail_probability
         self._silent_after_s = silent_after_s
+        self._invalid_after_s = invalid_after_s
         self._stop_event = threading.Event()
         self._start_time: Optional[float] = None
 
@@ -59,7 +63,10 @@ class _MockWorker(threading.Thread):
                 continue
 
             try:
-                self._publish_one_reading()
+                if self._is_invalid():
+                    self._update_fn(None, 0.0)
+                else:
+                    self._publish_one_reading()
             except Exception:  # noqa: BLE001 -- a worker thread must never die silently
                 logger.exception("%s: unexpected error during tick", self.name)
 
@@ -69,6 +76,11 @@ class _MockWorker(threading.Thread):
         if self._silent_after_s is None:
             return False
         return (time.monotonic() - self._start_time) > self._silent_after_s
+
+    def _is_invalid(self) -> bool:
+        if self._invalid_after_s is None:
+            return False
+        return (time.monotonic() - self._start_time) > self._invalid_after_s
 
     def _publish_one_reading(self) -> None:
         if random.random() < self._fail_probability:

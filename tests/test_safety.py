@@ -67,10 +67,10 @@ def scenario_normal_stays_normal():
 
 
 def scenario_link_lost_is_near_instant():
-    """Drone link loss -> LAND on the very first bad tick (link_lost_land_ticks=1)."""
+    """Drone link loss -> EMERGENCY_STOP on the first bad tick."""
     monitor = SafetyMonitor(THRESHOLDS)
     decision = monitor.evaluate(snap(), result(), now=NOW, drone_link_ok=False)
-    check("link_lost: LAND on first bad tick", decision.action == SafetyAction.LAND)
+    check("link_lost: EMERGENCY_STOP on first bad tick", decision.action == SafetyAction.EMERGENCY_STOP)
     check("link_lost: reason is drone_link_lost", decision.reason == "drone_link_lost")
 
 
@@ -79,7 +79,7 @@ def scenario_link_lost_preempts_everything_else():
     monitor = SafetyMonitor(THRESHOLDS)
     bad_result = result(index=0.95, disagreement=0.9)  # would trigger high-fatigue AND disagreement
     decision = monitor.evaluate(snap(), bad_result, now=NOW, drone_link_ok=False)
-    check("preempt: LAND (link) not disagreement/fatigue", decision.action == SafetyAction.LAND)
+    check("preempt: EMERGENCY_STOP (link) not disagreement/fatigue", decision.action == SafetyAction.EMERGENCY_STOP)
     check("preempt: reason is drone_link_lost, not fatigue/disagreement", decision.reason == "drone_link_lost")
 
 
