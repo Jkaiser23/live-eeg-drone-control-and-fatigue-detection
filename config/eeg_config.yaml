@@ -50,10 +50,14 @@ dataset:
     ]
   val_subjects: [41, 42, 43, 44, 45, 46, 47, 48, 49, 50]
 
-  runs: [4, 8, 10, 11, 12] # Motor IMAGERY of left/right hand (not actual movement!)
+  runs: [4, 8, 12] # Motor IMAGERY of left/right hand (not actual movement!)
   # Run 4: imagine left/right fist (first session)
   # Run 8: imagine left/right fist (second session)
   # Run 12: imagine left/right fist (third session)
+  # Do NOT add 3/7/11 (ACTUAL left/right fist movement) or 5/6/9/10/13/14
+  # (fists/feet imagery -- a different task entirely). load_subject() filters
+  # purely on T1/T2 event codes with no run-awareness, so runs outside
+  # {4, 8, 12} get silently relabeled as left/right hand.
 
 # Signal processing
 preprocessing:

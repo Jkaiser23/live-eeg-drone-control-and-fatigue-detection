@@ -65,8 +65,15 @@ def load_test_data(config):
     dataset_config = config["dataset"]
     preprocess_config = config["preprocessing"]
 
-    # Use a subject not in training set for testing
-    test_subject = 6
+    # Use a held-out validation subject for testing. Read from config rather
+    # than hardcoded so it can't silently drift out of sync with
+    # train_subjects/val_subjects again.
+    test_subject = dataset_config["val_subjects"][0]
+    assert test_subject not in dataset_config["train_subjects"], (
+        f"Demo test_subject={test_subject} is in train_subjects; this would "
+        "silently report cross-subject accuracy on data the model was "
+        "trained on."
+    )
     data_dir = get_project_root() / "data" / "raw" / "physionet"
     dataset = PhysioNetDataset(str(data_dir))
 

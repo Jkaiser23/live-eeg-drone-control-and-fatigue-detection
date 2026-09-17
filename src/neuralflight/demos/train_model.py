@@ -2,6 +2,7 @@
 """Train EEGNet model on PhysioNet Motor Imagery dataset."""
 
 import os
+from typing import cast
 
 import numpy as np
 import torch
@@ -40,7 +41,7 @@ def prepare_data(config: dict):
     channels = preprocess_config["channels"]
 
     # Load training subjects
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("LOADING TRAINING SUBJECTS")
     print("=" * 60)
     train_X, train_y = [], []
@@ -88,7 +89,7 @@ def prepare_data(config: dict):
             continue
 
     # Load validation subjects
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("LOADING VALIDATION SUBJECTS")
     print("=" * 60)
     val_X, val_y = [], []
@@ -147,7 +148,7 @@ def prepare_data(config: dict):
     X_val = np.concatenate(val_X, axis=0)
     y_val = np.concatenate(val_y, axis=0)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("DATASET SUMMARY")
     print("=" * 60)
     print("Training:")
@@ -223,15 +224,18 @@ def train_model(config: dict, X_train, y_train, X_val, y_val):
             kernel_length=model_config["kernel_length"],
         )
 
-    model = EEGNet(
-        n_channels=model_config["input_channels"],
-        n_classes=model_config["num_classes"] - 2,  # Only left/right for now
-        n_samples=X_train.shape[2],
-        dropout=model_config["dropout"],
-        kernel_length=model_config["kernel_length"],
+    # Guard against silently training/saving the wrong architecture: the
+    # branch above is the single source of truth for model selection, and
+    # nothing after this point may reassign `model`.
+    expected_class = "EEGNetResidual" if use_residual else "EEGNet"
+    assert model.__class__.__name__ == expected_class, (
+        f"use_residual={use_residual} but model is "
+        f"{model.__class__.__name__}, not {expected_class}"
     )
 
-    classifier = EEGClassifier(model, device)
+    # EEGClassifier supports both architectures, but its annotation currently
+    # only declares EEGNet.
+    classifier = EEGClassifier(cast(EEGNet, model), device)
 
     # Training setup
     criterion = nn.CrossEntropyLoss()
@@ -263,7 +267,7 @@ def train_model(config: dict, X_train, y_train, X_val, y_val):
         val_acc = np.mean(val_accs)
 
         print(
-            f"Epoch {epoch+1:02d}/{config['training']['num_epochs']} | "
+            f"Epoch {epoch + 1:02d}/{config['training']['num_epochs']} | "
             f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
             f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f}"
         )
@@ -285,7 +289,7 @@ def train_model(config: dict, X_train, y_train, X_val, y_val):
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"\nEarly stopping after {epoch+1} epochs")
+                print(f"\nEarly stopping after {epoch + 1} epochs")
                 break
 
     print(f"\n✓ Training complete! Best validation accuracy: {best_val_acc:.4f}")
