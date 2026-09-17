@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
-"""Train EEGNet model on PhysioNet Motor Imagery dataset."""
+"""Train the canonical two-class EEGNet motor-imagery classifier.
+
+The training contract is:
+    class 0 -> left-hand motor imagery -> strafe_left
+    class 1 -> right-hand motor imagery -> strafe_right
+
+The saved checkpoint contains the complete EEGNet architecture configuration
+plus training and dataset metadata needed to reproduce the model.
+"""
+
+from __future__ import annotations
 
 import os
-from typing import cast
 
 import numpy as np
 import torch
@@ -16,312 +25,349 @@ from neuralflight.models.eegnet import EEGClassifier, EEGNet
 from neuralflight.utils.config_loader import get_project_root, load_config
 
 
+CLASS_TO_COMMAND = {
+    0: "strafe_left",
+    1: "strafe_right",
+}
+
+
+def _validate_two_class_data(X, y, split_name: str, expected_channels: int):
+    """Validate the model-facing EEG data contract."""
+    if X is None or y is None or len(X) == 0:
+        raise ValueError(f"{split_name}: no EEG data was loaded")
+
+    if X.ndim != 3:
+        raise ValueError(
+            f"{split_name}: expected X shape (epochs, channels, samples), "
+            f"received {X.shape}"
+        )
+
+    if X.shape[1] != expected_channels:
+        raise ValueError(
+            f"{split_name}: expected {expected_channels} EEG channels, "
+            f"received {X.shape[1]}"
+        )
+
+    if len(X) != len(y):
+        raise ValueError(
+            f"{split_name}: X/y length mismatch ({len(X)} != {len(y)})"
+        )
+
+    labels = set(np.unique(y).tolist())
+    if not labels.issubset({0, 1}):
+        raise ValueError(
+            f"{split_name}: labels must be only 0 and 1; received {labels}"
+        )
+
+
+def _load_split(dataset, subject_ids, runs, channels, preprocess_config, split_name):
+    """Load one subject-level split and map its two events to 0/1."""
+    X_parts, y_parts = [], []
+
+    for subject_id in tqdm(subject_ids, desc=f"{split_name} subjects"):
+        try:
+            dataset.download_subject(subject_id, runs)
+            X, y = dataset.load_subject(subject_id, runs, channels)
+
+            if X is None or len(X) == 0:
+                print(f"  Subject {subject_id}: no data returned")
+                continue
+
+            unique_events = np.unique(y)
+            if len(unique_events) != 2:
+                print(
+                    f"  Subject {subject_id}: expected exactly 2 events, "
+                    f"got {unique_events}; skipping"
+                )
+                continue
+
+            event_map = {1: 0, 2: 1}
+            if not set(unique_events).issubset(event_map):
+                print(
+                    f"  Subject {subject_id}: unexpected event IDs "
+                    f"{unique_events}; skipping"
+                )
+                continue
+
+            y = np.asarray([event_map[int(label)] for label in y], dtype=np.int64)
+
+            X = preprocess_eeg(
+                X,
+                lowcut=preprocess_config["lowcut"],
+                highcut=preprocess_config["highcut"],
+                fs=preprocess_config["sampling_rate"],
+            )
+
+            X_parts.append(X)
+            y_parts.append(y)
+            print(f"  Subject {subject_id}: ✓ {len(X)} epochs")
+
+        except Exception as exc:
+            print(f"  Subject {subject_id}: ✗ {exc}")
+
+    if not X_parts:
+        raise ValueError(f"No usable {split_name.lower()} subjects were loaded")
+
+    return np.concatenate(X_parts, axis=0), np.concatenate(y_parts, axis=0), len(X_parts)
+
+
 def prepare_data(config: dict):
-    """Download and prepare dataset with SUBJECT-LEVEL split."""
+    """Download and prepare subject-level train/validation data."""
     print("=" * 60)
     print("PREPARING DATASET")
     print("=" * 60)
 
     dataset_config = config["dataset"]
+    preprocess_config = config["preprocessing"]
+    model_config = config["model"]
+
+    if model_config["num_classes"] != 2:
+        raise ValueError(
+            "eeg_config.yaml must define exactly 2 model classes for motor imagery"
+        )
+
     train_subjects = dataset_config["train_subjects"]
     val_subjects = dataset_config["val_subjects"]
     runs = dataset_config["runs"]
+    channels = preprocess_config["channels"]
 
-    print("\nSubject split (CRITICAL for preventing overfitting!):")
+    print("\nSubject split:")
     print(f"  Training subjects: {train_subjects}")
     print(f"  Validation subjects: {val_subjects}")
     print(f"  Runs per subject: {runs}")
+    print(f"  EEG channels: {len(channels)}")
+    print("  Classes: 0=left hand, 1=right hand")
 
-    # Initialize dataset
     data_dir = get_project_root() / "data" / "raw" / "physionet"
     dataset = PhysioNetDataset(str(data_dir))
 
-    preprocess_config = config["preprocessing"]
-    channels = preprocess_config["channels"]
-
-    # Load training subjects
     print(f"\n{'=' * 60}")
     print("LOADING TRAINING SUBJECTS")
     print("=" * 60)
-    train_X, train_y = [], []
+    X_train, y_train, train_count = _load_split(
+        dataset, train_subjects, runs, channels, preprocess_config, "Training"
+    )
 
-    for subject_id in tqdm(train_subjects, desc="Training subjects"):
-        try:
-            # Download if needed
-            dataset.download_subject(subject_id, runs)
-
-            # Load data
-            X, y = dataset.load_subject(subject_id, runs, channels)
-
-            if X is None or len(X) == 0:
-                print(f"  Subject {subject_id}: No data returned")
-                continue
-
-            unique_events = np.unique(y)
-            print(f"  Subject {subject_id}: Event IDs {unique_events}")
-
-            if len(unique_events) != 2:
-                print(
-                    f"  Subject {subject_id}:"
-                    f" Expected 2 events, got {len(unique_events)}"
-                )
-                continue
-
-            # Remap to 0, 1
-            label_map = {unique_events[0]: 0, unique_events[1]: 1}
-            y = np.array([label_map[label] for label in y])
-
-            # Apply bandpass filter
-            X = preprocess_eeg(
-                X,
-                lowcut=preprocess_config["lowcut"],
-                highcut=preprocess_config["highcut"],
-                fs=preprocess_config["sampling_rate"],
-            )
-
-            train_X.append(X)
-            train_y.append(y)
-            print(f"  Subject {subject_id}: ✓ {len(X)} epochs")
-
-        except Exception as e:
-            print(f"  Subject {subject_id}: ✗ {e}")
-            continue
-
-    # Load validation subjects
     print(f"\n{'=' * 60}")
     print("LOADING VALIDATION SUBJECTS")
     print("=" * 60)
-    val_X, val_y = [], []
+    X_val, y_val, val_count = _load_split(
+        dataset, val_subjects, runs, channels, preprocess_config, "Validation"
+    )
 
-    for subject_id in tqdm(val_subjects, desc="Validation subjects"):
-        try:
-            # Download if needed
-            dataset.download_subject(subject_id, runs)
+    expected_channels = model_config["input_channels"]
+    _validate_two_class_data(X_train, y_train, "Training", expected_channels)
+    _validate_two_class_data(X_val, y_val, "Validation", expected_channels)
 
-            # Load data
-            X, y = dataset.load_subject(subject_id, runs, channels)
+    expected_samples = int(
+        round(
+            (config["epochs"]["tmax"] - config["epochs"]["tmin"])
+            * preprocess_config["sampling_rate"]
+        )
+    )
 
-            if X is None or len(X) == 0:
-                print(f"  Subject {subject_id}: No data returned")
-                continue
+    if X_train.shape[2] != expected_samples or X_val.shape[2] != expected_samples:
+        raise ValueError(
+            f"Epoch length mismatch: expected {expected_samples} samples; "
+            f"train={X_train.shape[2]}, val={X_val.shape[2]}"
+        )
 
-            unique_events = np.unique(y)
-            print(f"Subject {subject_id}: Event IDs {unique_events}")
-
-            if len(unique_events) != 2:
-                print(
-                    f"Subject {subject_id}: Expected 2 events, got {len(unique_events)}"
-                )
-                continue
-
-            # Remap to 0, 1
-            label_map = {unique_events[0]: 0, unique_events[1]: 1}
-            y = np.array([label_map[label] for label in y])
-
-            # Apply bandpass filter
-            X = preprocess_eeg(
-                X,
-                lowcut=preprocess_config["lowcut"],
-                highcut=preprocess_config["highcut"],
-                fs=preprocess_config["sampling_rate"],
-            )
-
-            val_X.append(X)
-            val_y.append(y)
-            print(f"  Subject {subject_id}: ✓ {len(X)} epochs")
-
-        except Exception as e:
-            print(f"  Subject {subject_id}: ✗ {e}")
-            continue
-
-    # Check if we have data
-    if len(train_X) == 0 or len(val_X) == 0:
-        print("\n❌ ERROR: Need data for both training and validation!")
-        print(f"Training subjects loaded: {len(train_X)}")
-        print(f"Validation subjects loaded: {len(val_X)}")
-        return None, None, None, None
-
-    # Concatenate
-    X_train = np.concatenate(train_X, axis=0)
-    y_train = np.concatenate(train_y, axis=0)
-    X_val = np.concatenate(val_X, axis=0)
-    y_val = np.concatenate(val_y, axis=0)
+    if set(np.unique(y_train).tolist()) != {0, 1}:
+        raise ValueError("Training data must contain both classes 0 and 1")
+    if set(np.unique(y_val).tolist()) != {0, 1}:
+        raise ValueError("Validation data must contain both classes 0 and 1")
 
     print(f"\n{'=' * 60}")
     print("DATASET SUMMARY")
     print("=" * 60)
-    print("Training:")
-    print(f"  Subjects: {len(train_X)} successfully loaded")
-    print(f"  Epochs: {len(X_train)}")
-    print(f"  Shape: {X_train.shape}")
-    print(f"  Class distribution: {np.bincount(y_train)}")
-
-    print("\nValidation:")
-    print(f"  Subjects: {len(val_X)} successfully loaded")
-    print(f"  Epochs: {len(X_val)}")
-    print(f"  Shape: {X_val.shape}")
-    print(f"  Class distribution: {np.bincount(y_val)}")
-
-    print(f"\nTotal: {len(X_train) + len(X_val)} epochs")
-    print("Classes: 0=left hand, 1=right hand")
+    print(f"Training subjects loaded: {train_count}")
+    print(f"Training epochs: {len(X_train)}")
+    print(f"Training shape: {X_train.shape}")
+    print(f"Training class distribution: {np.bincount(y_train, minlength=2)}")
+    print(f"Validation subjects loaded: {val_count}")
+    print(f"Validation epochs: {len(X_val)}")
+    print(f"Validation shape: {X_val.shape}")
+    print(f"Validation class distribution: {np.bincount(y_val, minlength=2)}")
 
     return X_train, y_train, X_val, y_val
 
 
+def _build_checkpoint_metadata(config, epoch, val_loss, val_acc, device):
+    """Build reproducibility metadata for the saved checkpoint."""
+    dataset_config = config["dataset"]
+    preprocess_config = config["preprocessing"]
+    model_config = config["model"]
+    training_config = config["training"]
+    epochs_config = config["epochs"]
+
+    return {
+        "training_metadata": {
+            "epoch": epoch,
+            "validation_loss": float(val_loss),
+            "validation_accuracy": float(val_acc),
+            "device": str(device),
+            "batch_size": int(training_config["batch_size"]),
+            "learning_rate": float(training_config["learning_rate"]),
+            "num_epochs": int(training_config["num_epochs"]),
+            "early_stopping_patience": int(training_config["early_stopping_patience"]),
+        },
+        "data_metadata": {
+            "dataset": dataset_config["name"],
+            "runs": list(dataset_config["runs"]),
+            "train_subjects": list(dataset_config["train_subjects"]),
+            "val_subjects": list(dataset_config["val_subjects"]),
+            "channels": list(preprocess_config["channels"]),
+            "sampling_rate": int(preprocess_config["sampling_rate"]),
+            "lowcut": float(preprocess_config["lowcut"]),
+            "highcut": float(preprocess_config["highcut"]),
+            "filter_order": int(preprocess_config["filter_order"]),
+            "notch_freq": float(preprocess_config["notch_freq"]),
+            "tmin": float(epochs_config["tmin"]),
+            "tmax": float(epochs_config["tmax"]),
+        },
+        "label_metadata": {
+            "num_classes": 2,
+            "class_to_command": {str(k): v for k, v in CLASS_TO_COMMAND.items()},
+            "class_to_meaning": {
+                "0": "left-hand motor imagery",
+                "1": "right-hand motor imagery",
+            },
+        },
+        "config_metadata": {
+            "model": dict(model_config),
+            "config_file": "config/eeg_config.yaml",
+        },
+    }
+
+
 def train_model(config: dict, X_train, y_train, X_val, y_val):
-    """Train the model."""
+    """Train EEGNet and save the best validation checkpoint."""
     print("\n" + "=" * 60)
     print("TRAINING MODEL")
     print("=" * 60)
 
-    print(f"\nTrain samples: {len(X_train)}")
-    print(f"Validation samples: {len(X_val)}")
+    model_config = config["model"]
+    training_config = config["training"]
 
-    # Convert to PyTorch tensors
+    if model_config["architecture"] != "EEGNet":
+        raise ValueError(
+            f"Unsupported architecture: {model_config['architecture']!r}. "
+            "The project now uses only the consolidated EEGNet."
+        )
+    if model_config["num_classes"] != 2:
+        raise ValueError("EEGNet training requires exactly 2 classes")
+
     X_train = torch.FloatTensor(X_train)
     y_train = torch.LongTensor(y_train)
     X_val = torch.FloatTensor(X_val)
     y_val = torch.LongTensor(y_val)
 
-    # Create data loaders
-    train_dataset = TensorDataset(X_train, y_train)
-    val_dataset = TensorDataset(X_val, y_val)
-
     train_loader = DataLoader(
-        train_dataset, batch_size=config["training"]["batch_size"], shuffle=True
+        TensorDataset(X_train, y_train),
+        batch_size=training_config["batch_size"],
+        shuffle=True,
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=config["training"]["batch_size"], shuffle=False
+        TensorDataset(X_val, y_val),
+        batch_size=training_config["batch_size"],
+        shuffle=False,
     )
 
-    # Initialize model
-    model_config = config["model"]
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"\nUsing device: {device}")
+    print("Using consolidated EEGNet")
 
-    # Use residual version for better performance
-    use_residual = model_config.get("use_residual", True)
-    use_attention = model_config.get("use_attention", False)
-
-    if use_residual:
-        print(f"Using EEGNetResidual (attention: {use_attention})")
-        model = EEGNetResidual(
-            n_channels=model_config["input_channels"],
-            n_classes=model_config["num_classes"] - 2,  # Only left/right
-            n_samples=X_train.shape[2],
-            dropout=model_config["dropout"],
-            kernel_length=model_config["kernel_length"],
-            use_attention=use_attention,
-        )
-    else:
-        print("Using original EEGNet")
-        model = EEGNet(
-            n_channels=model_config["input_channels"],
-            n_classes=model_config["num_classes"] - 2,
-            n_samples=X_train.shape[2],
-            dropout=model_config["dropout"],
-            kernel_length=model_config["kernel_length"],
-        )
-
-    # Guard against silently training/saving the wrong architecture: the
-    # branch above is the single source of truth for model selection, and
-    # nothing after this point may reassign `model`.
-    expected_class = "EEGNetResidual" if use_residual else "EEGNet"
-    assert model.__class__.__name__ == expected_class, (
-        f"use_residual={use_residual} but model is "
-        f"{model.__class__.__name__}, not {expected_class}"
+    model = EEGNet(
+        n_channels=model_config["input_channels"],
+        n_classes=2,
+        n_samples=X_train.shape[2],
+        dropout=model_config["dropout"],
+        kernel_length=model_config["kernel_length"],
+        F1=model_config.get("F1", 8),
+        D=model_config.get("D", 2),
+        F2=model_config.get("F2", 16),
+        use_attention=model_config.get("use_attention", False),
     )
-
-    # EEGClassifier supports both architectures, but its annotation currently
-    # only declares EEGNet.
-    classifier = EEGClassifier(cast(EEGNet, model), device)
-
-    # Training setup
+    classifier = EEGClassifier(model, device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=config["training"]["learning_rate"])
+    optimizer = optim.Adam(model.parameters(), lr=training_config["learning_rate"])
 
-    # Training loop
+    best_val_loss = float("inf")
     best_val_acc = 0.0
     patience_counter = 0
-    patience = config["training"]["early_stopping_patience"]
+    patience = training_config["early_stopping_patience"]
 
-    for epoch in range(config["training"]["num_epochs"]):
-        # Training
+    save_path = get_project_root() / training_config["savedir"] / training_config["savename"]
+    os.makedirs(save_path.parent, exist_ok=True)
+
+    for epoch in range(training_config["num_epochs"]):
         train_losses, train_accs = [], []
         for X_batch, y_batch in train_loader:
             loss, acc = classifier.train_step(X_batch, y_batch, optimizer, criterion)
             train_losses.append(loss)
             train_accs.append(acc)
 
-        # Validation
         val_losses, val_accs = [], []
         for X_batch, y_batch in val_loader:
             loss, acc, _ = classifier.eval_step(X_batch, y_batch, criterion)
             val_losses.append(loss)
             val_accs.append(acc)
 
-        train_loss = np.mean(train_losses)
-        train_acc = np.mean(train_accs)
-        val_loss = np.mean(val_losses)
-        val_acc = np.mean(val_accs)
+        train_loss = float(np.mean(train_losses))
+        train_acc = float(np.mean(train_accs))
+        val_loss = float(np.mean(val_losses))
+        val_acc = float(np.mean(val_accs))
 
         print(
-            f"Epoch {epoch + 1:02d}/{config['training']['num_epochs']} | "
+            f"Epoch {epoch + 1:04d}/{training_config['num_epochs']} | "
             f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
             f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f}"
         )
 
-        # Early stopping and checkpointing
-        if val_acc > best_val_acc:
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             best_val_acc = val_acc
             patience_counter = 0
 
-            # Save best model
-            save_path = (
-                get_project_root()
-                / config["training"]["savedir"]
-                / config["training"]["savename"]
-            )
-            os.makedirs(save_path.parent, exist_ok=True)
             classifier.save(str(save_path))
-            print(f"  → Saved best model (val_acc: {val_acc:.4f})")
+            checkpoint = torch.load(save_path, map_location="cpu")
+            checkpoint.update(
+                _build_checkpoint_metadata(
+                    config, epoch + 1, val_loss, val_acc, device
+                )
+            )
+            torch.save(checkpoint, save_path)
+
+            print(
+                f"  → Saved best checkpoint "
+                f"(val_loss: {val_loss:.4f}, val_acc: {val_acc:.4f})"
+            )
         else:
             patience_counter += 1
-            if patience_counter >= patience:
-                print(f"\nEarly stopping after {epoch + 1} epochs")
-                break
+
+        if patience_counter >= patience:
+            print(f"\nEarly stopping after {epoch + 1} epochs")
+            break
+
+    if not save_path.exists():
+        raise RuntimeError("Training completed without producing a checkpoint")
 
     print(f"\n✓ Training complete! Best validation accuracy: {best_val_acc:.4f}")
+    print(f"✓ Checkpoint: {save_path}")
     return classifier
 
 
 def main():
     print("\n🧠 EEG MOTOR IMAGERY CLASSIFIER TRAINING\n")
-
-    # Load config
     config = load_config("eeg_config")
-
-    # Prepare data
     X_train, y_train, X_val, y_val = prepare_data(config)
+    train_model(config, X_train, y_train, X_val, y_val)
 
-    # Check if data loading failed
-    if X_train is None or X_val is None:
-        print("\nCannot proceed without data. Exiting.")
-        return
-
-    # Train model
-    _ = train_model(config, X_train, y_train, X_val, y_val)
-
+    save_path = get_project_root() / config["training"]["savedir"] / config["training"]["savename"]
     print("\n" + "=" * 60)
     print("DONE!")
     print("=" * 60)
-    save_path = (
-        get_project_root()
-        / config["training"]["savedir"]
-        / config["training"]["savename"]
-    )
     print(f"\nModel saved to: {save_path}")
-    print("Run 'neuralflight-eeg' to test it!")
 
 
 if __name__ == "__main__":
