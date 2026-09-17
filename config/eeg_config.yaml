@@ -5,7 +5,8 @@ dataset:
   name: "PhysioNet Motor Imagery"
   url: "https://physionet.org/files/eegmmidb/1.0.0/"
 
-  # Subject split: CRITICAL for preventing overfitting!
+  # Subject-level split prevents samples from the same subject appearing in
+  # both training and validation sets.
   train_subjects:
     [
       1,
@@ -50,22 +51,19 @@ dataset:
     ]
   val_subjects: [41, 42, 43, 44, 45, 46, 47, 48, 49, 50]
 
-  runs: [4, 8, 12] # Motor IMAGERY of left/right hand (not actual movement!)
-  # Run 4: imagine left/right fist (first session)
-  # Run 8: imagine left/right fist (second session)
-  # Run 12: imagine left/right fist (third session)
-  # Do NOT add 3/7/11 (ACTUAL left/right fist movement) or 5/6/9/10/13/14
-  # (fists/feet imagery -- a different task entirely). load_subject() filters
-  # purely on T1/T2 event codes with no run-awareness, so runs outside
-  # {4, 8, 12} get silently relabeled as left/right hand.
+  # Motor-imagery runs only:
+  # 4 = imagine left/right fist, session 1
+  # 8 = imagine left/right fist, session 2
+  # 12 = imagine left/right fist, session 3
+  runs: [4, 8, 12]
 
 # Signal processing
 preprocessing:
   sampling_rate: 160 # Hz
-  lowcut: 8.0 # Hz, start of alpha band
-  highcut: 30.0 # Hz, end of beta band
+  lowcut: 8.0 # Hz
+  highcut: 30.0 # Hz
   filter_order: 5
-  notch_freq: 60.0 # Hz, US power line frequency
+  notch_freq: 60.0 # Hz
   channels:
     [
       "FC3",
@@ -89,32 +87,33 @@ preprocessing:
 
 # Epoching
 epochs:
-  tmin: 0.0 # Start time relative to event (seconds)
-  tmax: 3.0 # End time relative to event (seconds)
-  baseline: null # No baseline correction for now
+  tmin: 0.0
+  tmax: 3.0
+  baseline: null
 
 # Model training
 model:
   architecture: "EEGNet"
   input_channels: 17
-  num_classes: 4 # left hand, right hand, feet, rest
+  n_samples: 480
+  num_classes: 2
   dropout: 0.5
   kernel_length: 64
-  use_residual: true # Use residual connections for better gradient flow
-  use_attention: false # Optional attention (slower, may improve accuracy)
+  F1: 8
+  D: 2
+  F2: 16
+  use_attention: false
 
 training:
   batch_size: 64
   learning_rate: 0.001
-  num_epochs: 1000 # Increased for residual network
-  validation_split: 0.2
-  early_stopping_patience: 200 # More patience for residual network
+  num_epochs: 1000
+  early_stopping_patience: 200
   savedir: models/baseline_2
   savename: eegnet_best.pth
 
-# Command mapping
+# Motor-imagery command mapping
+# 0 = left-hand imagery, 1 = right-hand imagery
 class_to_command:
-  0: "strafe_left" # Left hand imagery
-  1: "strafe_right" # Right hand imagery
-  2: "forward" # Feet imagery
-  3: "hover" # Rest/no imagery
+  0: "strafe_left"
+  1: "strafe_right"
