@@ -14,7 +14,7 @@ Stop: Ctrl+C
 import time
 
 from neuralflight.fatigue.fusion import compute_fatigue_index
-from neuralflight.fatigue.mock_workers import MockEEGWorker, MockVisionWorker
+from tests.helpers.mock_workers import MockEEGWorker, MockVisionWorker
 from neuralflight.fatigue.shared_state import SharedFatigueState
 
 TICK_HZ = 5.0
@@ -28,8 +28,10 @@ VISION_SILENT_AFTER_S = 10.0
 def main() -> None:
     state = SharedFatigueState()
 
-    eeg_worker = MockEEGWorker(state, interval_s=0.4, fail_probability=EEG_FAIL_PROBABILITY)
-    vision_worker = MockVisionWorker(state, interval_s=0.2, silent_after_s=VISION_SILENT_AFTER_S)
+    eeg_worker = MockEEGWorker(state, interval_s=0.4,
+                               fail_probability=EEG_FAIL_PROBABILITY)
+    vision_worker = MockVisionWorker(
+        state, interval_s=0.2, silent_after_s=VISION_SILENT_AFTER_S)
     eeg_worker.start()
     vision_worker.start()
 

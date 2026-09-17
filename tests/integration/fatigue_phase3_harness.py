@@ -25,7 +25,7 @@ import time
 
 from neuralflight.controllers.drone_controller import DroneController
 from neuralflight.fatigue.fusion import compute_fatigue_index
-from neuralflight.fatigue.mock_workers import MockEEGWorker, MockVisionWorker
+from tests.helpers.mock_workers import MockEEGWorker, MockVisionWorker
 from neuralflight.fatigue.safety import SafetyAction, SafetyMonitor
 from neuralflight.fatigue.shared_state import SharedFatigueState
 from neuralflight.simulator.drone_sim import DroneSimulator
@@ -49,14 +49,18 @@ def main() -> None:
     state = SharedFatigueState()
     safety = SafetyMonitor()
 
-    eeg_worker = MockEEGWorker(state, interval_s=0.4, fail_probability=EEG_FAIL_PROBABILITY)
-    vision_worker = MockVisionWorker(state, interval_s=0.2, invalid_after_s=VISION_FAILURE_AFTER_S)
+    eeg_worker = MockEEGWorker(state, interval_s=0.4,
+                               fail_probability=EEG_FAIL_PROBABILITY)
+    vision_worker = MockVisionWorker(
+        state, interval_s=0.2, invalid_after_s=VISION_FAILURE_AFTER_S)
     eeg_worker.start()
     vision_worker.start()
 
     print("Phase 3 harness running against the real DroneSimulator.")
-    print(f"  Vision reads fail from t={VISION_FAILURE_AFTER_S:.0f}s while worker stays alive (expect HOVER then LAND)")
-    print(f"  Drone link forced down at t={LINK_DOWN_START_S:.0f}s for {LINK_DOWN_DURATION_S}s (expect emergency stop)")
+    print(
+        f"  Vision reads fail from t={VISION_FAILURE_AFTER_S:.0f}s while worker stays alive (expect HOVER then LAND)")
+    print(
+        f"  Drone link forced down at t={LINK_DOWN_START_S:.0f}s for {LINK_DOWN_DURATION_S}s (expect emergency stop)")
     print("  Ctrl+C or close the window to stop.\n")
 
     start_time = time.monotonic()
@@ -73,7 +77,8 @@ def main() -> None:
 
             snapshot = state.snapshot()
             fatigue_result = compute_fatigue_index(snapshot, now=tick_start)
-            decision = safety.evaluate(snapshot, fatigue_result, now=tick_start, drone_link_ok=drone_link_ok)
+            decision = safety.evaluate(
+                snapshot, fatigue_result, now=tick_start, drone_link_ok=drone_link_ok)
 
             if decision.action == SafetyAction.EMERGENCY_STOP:
                 controller.emergency_stop()

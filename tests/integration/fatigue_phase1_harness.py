@@ -19,7 +19,7 @@ Stop: Ctrl+C
 
 import time
 
-from neuralflight.fatigue.mock_workers import MockEEGWorker, MockVisionWorker
+from tests.helpers.mock_workers import MockEEGWorker, MockVisionWorker
 from neuralflight.fatigue.shared_state import SharedFatigueState
 
 TICK_HZ = 5.0  # slow tick is fine here -- this harness is for eyeballing, not real-time control
@@ -51,14 +51,17 @@ def describe(name: str, reading, now: float) -> str:
 def main() -> None:
     state = SharedFatigueState()
 
-    eeg_worker = MockEEGWorker(state, interval_s=0.4, fail_probability=EEG_FAIL_PROBABILITY)
-    vision_worker = MockVisionWorker(state, interval_s=0.2, silent_after_s=VISION_SILENT_AFTER_S)
+    eeg_worker = MockEEGWorker(state, interval_s=0.4,
+                               fail_probability=EEG_FAIL_PROBABILITY)
+    vision_worker = MockVisionWorker(
+        state, interval_s=0.2, silent_after_s=VISION_SILENT_AFTER_S)
     eeg_worker.start()
     vision_worker.start()
 
     print("Phase 1 harness starting.")
     print(f"  EEG worker: {EEG_FAIL_PROBABILITY:.0%} chance per tick of publishing NaN")
-    print(f"  Vision worker: goes silent after {VISION_SILENT_AFTER_S:.0f}s (simulates a dead thread)")
+    print(
+        f"  Vision worker: goes silent after {VISION_SILENT_AFTER_S:.0f}s (simulates a dead thread)")
     print("  Watch for: quality drops to 0.0 on NaN ticks, 'fresh' flips False after vision goes silent.\n")
 
     try:

@@ -23,7 +23,7 @@ import time
 from neuralflight.controllers.codrone_adapter import CoDroneWorker, CoDroneWorkerConfig
 from neuralflight.controllers.drone_controller import DroneController
 from neuralflight.fatigue.fusion import compute_fatigue_index
-from neuralflight.fatigue.mock_workers import MockEEGWorker, MockVisionWorker
+from tests.helpers.mock_workers import MockEEGWorker, MockVisionWorker
 from neuralflight.fatigue.safety import SafetyAction, SafetyMonitor
 from neuralflight.fatigue.shared_state import SharedFatigueState
 
@@ -63,7 +63,8 @@ def main() -> None:
 
             snapshot = state.snapshot()
             fatigue_result = compute_fatigue_index(snapshot, now=tick_start)
-            decision = safety.evaluate(snapshot, fatigue_result, now=tick_start, drone_link_ok=drone_link_ok)
+            decision = safety.evaluate(
+                snapshot, fatigue_result, now=tick_start, drone_link_ok=drone_link_ok)
 
             if decision.action == SafetyAction.EMERGENCY_STOP:
                 controller.emergency_stop()
