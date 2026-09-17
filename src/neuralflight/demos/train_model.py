@@ -13,7 +13,6 @@ from tqdm import tqdm
 
 from neuralflight.eeg.dataset import PhysioNetDataset, preprocess_eeg
 from neuralflight.models.eegnet import EEGClassifier, EEGNet
-from neuralflight.models.eegnet_residual import EEGNetResidual
 from neuralflight.utils.config_loader import get_project_root, load_config
 
 
