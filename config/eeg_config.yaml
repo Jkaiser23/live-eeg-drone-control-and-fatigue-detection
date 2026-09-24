@@ -66,26 +66,15 @@ preprocessing:
   highcut: 30.0 # Hz, end of beta band
   filter_order: 5
   notch_freq: 60.0 # Hz, US power line frequency
-  channels:
-    [
-      "FC3",
-      "FC1",
-      "FCz",
-      "FC2",
-      "FC4",
-      "C5",
-      "C3",
-      "C1",
-      "Cz",
-      "C2",
-      "C4",
-      "C6",
-      "CP3",
-      "CP1",
-      "CPz",
-      "CP2",
-      "CP4",
-    ]
+  # Trimmed from the original 17-channel dense motor-cortex ring (FC3-FC4,
+  # C5-C6, CP3-CP4) to match the live hardware montage: the OpenBCI
+  # Ultracortex Mark IV (16-channel default whole-scalp layout) only has
+  # C3/C4 wired at motor-cortex-relevant positions. Cz requires rerouting
+  # one electrode off a non-motor position (e.g. Fp1/Fp2/O1/O2). This is
+  # also OpenBCI's own documented electrode placement for motor imagery on
+  # this exact headset. Train/inference channel sets MUST match by name --
+  # see PhysioNetDataset.load_subject()'s raw.pick_channels(..., ordered=True).
+  channels: ["C3", "Cz", "C4"]
 
 # Epoching
 epochs:
@@ -96,7 +85,7 @@ epochs:
 # Model training
 model:
   architecture: "EEGNet"
-  input_channels: 17
+  input_channels: 3 # Matches preprocessing.channels above (C3, Cz, C4)
   num_classes: 4 # left hand, right hand, feet, rest
   dropout: 0.5
   kernel_length: 64
