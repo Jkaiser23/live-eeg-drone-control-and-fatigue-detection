@@ -123,9 +123,11 @@ def main() -> None:
 
             def record_segment(
                 seconds: float, label: str, event_code: str, trial: int,
-                scheduled_start: float | None = None,
             ) -> None:
-                segment_start = time.monotonic() if scheduled_start is None else scheduled_start
+                # Start the clock when recording actually begins. Anchoring later
+                # segments to an old schedule can make a segment expire before
+                # the first sample arrives after even a small acquisition delay.
+                segment_start = time.monotonic()
                 segment_end = segment_start + seconds
                 marker_written = False
                 while True:
@@ -157,20 +159,14 @@ def main() -> None:
             if run_type == "baseline":
                 record_segment(duration, "rest", "T0", 0)
             else:
-                # Fifteen 8-second pairs make each task run exactly two minutes.
-                run_start = time.monotonic()
+                # Fifteen 8-second pairs make each task run two minutes of
+                # recorded data. Each segment starts after the prior one ends.
                 for trial, target in enumerate(task_targets(), start=1):
-                    trial_start = run_start + (trial - 1) * 2 * SEGMENT_SECONDS
                     print(f"Trial {trial:02d}/{TRIAL_COUNT}: REST")
-                    record_segment(
-                        SEGMENT_SECONDS, "rest", "T0", trial, scheduled_start=trial_start
-                    )
+                    record_segment(SEGMENT_SECONDS, "rest", "T0", trial)
                     label = semantic_label(run_type, target)
                     print(f"  {target}: {label} ({mode})")
-                    record_segment(
-                        SEGMENT_SECONDS, label, target, trial,
-                        scheduled_start=trial_start + SEGMENT_SECONDS,
-                    )
+                    record_segment(SEGMENT_SECONDS, label, target, trial)
             print(f"Completed run {run_number:02d}")
 
     print(f"\nBaselines and task block {block_number} complete.")
