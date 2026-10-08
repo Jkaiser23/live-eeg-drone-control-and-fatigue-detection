@@ -1,0 +1,78 @@
+"""Filter each recorded EEG session and combine the results."""
+
+from __future__ import annotations
+
+import glob
+import os
+
+import numpy as np
+import pandas as pd
+from scipy.signal import butter, sosfiltfilt
+
+
+RAW_DIR = "data/raw"
+OUTPUT_PATH = "data/processed/eeg_clean.csv"
+SAMPLE_RATE = 250
+
+
+def bandpass(values: np.ndarray, low: float = 1, high: float = 40,
+             fs: float = SAMPLE_RATE, order: int = 4) -> np.ndarray:
+    """Apply a numerically stable zero-phase bandpass to sample rows."""
+    if values.ndim != 2 or values.shape[1] == 0:
+        raise ValueError("EEG data must be a 2D array with at least one channel")
+    if not 0 < low < high < fs / 2:
+        raise ValueError("Cutoffs must satisfy 0 < low < high < Nyquist frequency")
+    sos = np.asarray(butter(order, [low, high], btype="bandpass", fs=fs, output="sos"))
+    # sosfiltfilt needs more samples than its padding length.
+    padlen = 3 * (2 * sos.shape[0] + 1)
+    if len(values) <= padlen:
+        raise ValueError(f"Session has {len(values)} samples; at least {padlen + 1} are required")
+    return sosfiltfilt(sos, values, axis=0)
+
+
+def main() -> None:
+    print("Loading session data...")
+    file_paths = sorted(
+        path for path in glob.glob(os.path.join(RAW_DIR, "*.csv"))
+        if not path.endswith("_channels_3_4_5.csv")
+    )
+    if not file_paths:
+        raise FileNotFoundError(f"No CSV files found in {RAW_DIR}/")
+
+    sessions = []
+    expected_channels = None
+    for path in file_paths:
+        print(f"Loading {path}")
+        frame = pd.read_csv(path)
+        channel_names = [name for name in frame.columns if name.startswith("ch")]
+        if "label" not in frame or not channel_names:
+            raise ValueError(f"{path} must contain EEG channel columns and a label column")
+        if expected_channels is None:
+            expected_channels = channel_names
+        elif channel_names != expected_channels:
+            raise ValueError(f"EEG channels in {path} do not match the other sessions")
+        samples = frame[channel_names].apply(pd.to_numeric, errors="coerce")
+        if samples.isna().any().any():
+            raise ValueError(f"{path} contains missing or non-numeric EEG samples")
+        if frame["label"].isna().any():
+            raise ValueError(f"{path} contains missing labels")
+        # Filter each run independently so filtering never crosses run boundaries.
+        run_groups = frame.groupby("run", sort=False) if "run" in frame else [(None, frame)]
+        for _, run in run_groups:
+            run_samples = run[channel_names].apply(pd.to_numeric, errors="coerce")
+            if run_samples.isna().any().any() or run["label"].isna().any():
+                raise ValueError(f"{path} contains missing or non-numeric EEG values")
+            filtered = bandpass(run_samples.to_numpy(dtype=float))
+            clean = pd.DataFrame(filtered, columns=channel_names)
+            clean["label"] = run["label"].to_numpy()
+            sessions.append(clean)
+
+    data = pd.concat(sessions, ignore_index=True)
+    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+    data.to_csv(OUTPUT_PATH, index=False)
+    print(f"Total samples loaded: {len(data)}")
+    print(f"Clean data saved to: {OUTPUT_PATH}")
+
+
+if __name__ == "__main__":
+    main()

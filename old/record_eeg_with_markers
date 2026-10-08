@@ -1,0 +1,182 @@
+"""Record PhysioNet-order 16-channel EEG and a synchronized 3-channel subset."""
+
+from __future__ import annotations
+
+import csv
+import os
+import random
+import re
+import time
+
+from pylsl import StreamInlet, resolve_streams
+
+
+CHANNEL_COUNT = 16
+BASELINE_SECONDS = 60
+TASK_RUN_SECONDS = 120
+TRIAL_COUNT = 15
+SEGMENT_SECONDS = 4
+STREAM_TIMEOUT = 10
+OUTPUT_DIR = "data/raw"
+
+# EEGMMIDB: each four-condition block is one repetition of the task schedule.
+BASELINE_RUNS = [
+    (1, "baseline_eyes_open", "baseline", "eyes_open"),
+    (2, "baseline_eyes_closed", "baseline", "eyes_closed"),
+]
+TASK_BLOCKS = {
+    1: [
+        (3, "real_unilateral_fists", "unilateral", "real"),
+        (4, "imagined_unilateral_fists", "unilateral", "imagined"),
+        (5, "real_bilateral_fists_feet", "bilateral", "real"),
+        (6, "imagined_bilateral_fists_feet", "bilateral", "imagined"),
+    ],
+    2: [
+        (7, "real_unilateral_fists", "unilateral", "real"),
+        (8, "imagined_unilateral_fists", "unilateral", "imagined"),
+        (9, "real_bilateral_fists_feet", "bilateral", "real"),
+        (10, "imagined_bilateral_fists_feet", "bilateral", "imagined"),
+    ],
+    3: [
+        (11, "real_unilateral_fists", "unilateral", "real"),
+        (12, "imagined_unilateral_fists", "unilateral", "imagined"),
+        (13, "real_bilateral_fists_feet", "bilateral", "real"),
+        (14, "imagined_bilateral_fists_feet", "bilateral", "imagined"),
+    ],
+}
+
+
+def semantic_label(run_type: str, target: str) -> str:
+    if target == "T0":
+        return "rest"
+    if run_type == "unilateral":
+        return "left_fist" if target == "T1" else "right_fist"
+    return "both_fists" if target == "T1" else "both_feet"
+
+
+def task_targets() -> list[str]:
+    """Return 15 targets with the PhysioNet 7/8 class balance."""
+    targets = ["T1"] * (TRIAL_COUNT // 2) + ["T2"] * (TRIAL_COUNT // 2)
+    targets.append(random.choice(("T1", "T2")))
+    random.shuffle(targets)
+    return targets
+
+
+def main() -> None:
+    subject = input("Subject ID (for example S001): ").strip().upper()
+    subject = re.sub(r"[^A-Z0-9_-]", "", subject)
+    if not subject:
+        raise ValueError("Subject ID must contain at least one letter or digit")
+    try:
+        block_number = int(input("Task block to record (1, 2, or 3): ").strip())
+    except ValueError as error:
+        raise ValueError("Task block must be 1, 2, or 3") from error
+    if block_number not in TASK_BLOCKS:
+        raise ValueError("Task block must be 1, 2, or 3")
+
+    print("Looking for a 16-channel EEG stream...")
+    streams = resolve_streams(wait_time=STREAM_TIMEOUT)
+    eeg_streams = [
+        stream for stream in streams
+        if stream.type().upper() == "EEG" and stream.channel_count() == CHANNEL_COUNT
+    ]
+    if not eeg_streams:
+        counts = [stream.channel_count() for stream in streams if stream.type().upper() == "EEG"]
+        raise RuntimeError(
+            f"Need an EEG stream with exactly {CHANNEL_COUNT} channels; found channel counts {counts}"
+        )
+    stream = eeg_streams[0]
+    inlet = StreamInlet(stream)
+    print(f"Using {stream.name()} ({CHANNEL_COUNT} channels).")
+    first_sample, _ = inlet.pull_sample(timeout=STREAM_TIMEOUT)
+    if first_sample is None or len(first_sample) != CHANNEL_COUNT:
+        raise RuntimeError("EEG stream did not provide a valid 16-channel sample")
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    session_start = time.monotonic()
+    session_id = time.strftime("%Y%m%d_%H%M%S")
+
+    stem = f"{subject}_{session_id}_block_{block_number}"
+    all_path = os.path.join(OUTPUT_DIR, f"{stem}_all_channels.csv")
+    subset_path = os.path.join(OUTPUT_DIR, f"{stem}_channels_3_4_5.csv")
+    metadata = ["timestamp", "block", "run", "condition", "mode", "trial"]
+    channel_names = [f"ch{i:02d}" for i in range(CHANNEL_COUNT)]
+
+    with open(all_path, "w", newline="", encoding="utf-8") as all_file, open(
+        subset_path, "w", newline="", encoding="utf-8"
+    ) as subset_file:
+        all_writer = csv.writer(all_file)
+        subset_writer = csv.writer(subset_file)
+        all_writer.writerow(metadata + channel_names + ["label", "event_code"])
+        # Channel indices follow the recorder's zero-based ch00..ch15 names.
+        subset_writer.writerow(metadata + ["ch03", "ch04", "ch05"] + ["label", "event_code"])
+
+        selected_runs = BASELINE_RUNS + TASK_BLOCKS[block_number]
+        print(f"Recording baselines and task block {block_number}/3.")
+        for run_number, run_name, run_type, mode in selected_runs:
+            duration = BASELINE_SECONDS if run_type == "baseline" else TASK_RUN_SECONDS
+            print(f"\nRun {run_number:02d}: {run_name} ({duration // 60} min)")
+            if run_number == 1:
+                print("Keep eyes open during this baseline.")
+            elif run_number == 2:
+                print("Close eyes during this baseline.")
+
+            def record_segment(
+                seconds: float, label: str, event_code: str, trial: int,
+                scheduled_start: float | None = None,
+            ) -> None:
+                segment_start = time.monotonic() if scheduled_start is None else scheduled_start
+                segment_end = segment_start + seconds
+                marker_written = False
+                while True:
+                    remaining = segment_end - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    sample, _ = inlet.pull_sample(timeout=min(1.0, remaining))
+                    if sample is None:
+                        continue
+                    if len(sample) != CHANNEL_COUNT:
+                        raise RuntimeError("EEG channel count changed during recording")
+                    try:
+                        values = [float(value) for value in sample]
+                    except (TypeError, ValueError) as error:
+                        raise RuntimeError("EEG stream returned a non-numeric sample") from error
+                    elapsed = time.monotonic() - session_start
+                    marker = event_code if not marker_written else ""
+                    row_metadata = [elapsed, block_number, run_number, run_name, mode, trial]
+                    all_writer.writerow(row_metadata + values + [label, marker])
+                    subset_writer.writerow(
+                        row_metadata + [values[3], values[4], values[5], label, marker]
+                    )
+                    marker_written = True
+                all_file.flush()
+                subset_file.flush()
+                if not marker_written:
+                    raise RuntimeError("No EEG samples arrived during a segment; recording stopped")
+
+            if run_type == "baseline":
+                record_segment(duration, "rest", "T0", 0)
+            else:
+                # Fifteen 8-second pairs make each task run exactly two minutes.
+                run_start = time.monotonic()
+                for trial, target in enumerate(task_targets(), start=1):
+                    trial_start = run_start + (trial - 1) * 2 * SEGMENT_SECONDS
+                    print(f"Trial {trial:02d}/{TRIAL_COUNT}: REST")
+                    record_segment(
+                        SEGMENT_SECONDS, "rest", "T0", trial, scheduled_start=trial_start
+                    )
+                    label = semantic_label(run_type, target)
+                    print(f"  {target}: {label} ({mode})")
+                    record_segment(
+                        SEGMENT_SECONDS, label, target, trial,
+                        scheduled_start=trial_start + SEGMENT_SECONDS,
+                    )
+            print(f"Completed run {run_number:02d}")
+
+    print(f"\nBaselines and task block {block_number} complete.")
+    print(f"All channels: {all_path}")
+    print(f"Channels 3, 4, and 5: {subset_path}")
+
+
+if __name__ == "__main__":
+    main()
