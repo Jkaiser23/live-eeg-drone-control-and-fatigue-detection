@@ -1,77 +1,403 @@
-"""Filter each recorded EEG session and combine the results."""
+"""
+Preprocessing pipeline for the JOEL motor-imagery / motor-execution EEG recordings.
+
+Turns the raw per-sample CSVs (one row per EEG sample) into per-trial epochs
+ready for a classifier, and addresses the issues found in the raw data:
+
+  1. Irregular sample timing (LSL jitter)   -> resample onto a uniform time grid
+  2. Block-dependent DC offsets             -> band-pass filter removes drift/DC
+  3. Mains interference                     -> notch filter at 60 Hz
+  4. Row-level (not trial-level) data       -> epoch into one example per trial-segment
+  5. rest is over-represented / two sources -> kept but clearly separable via `label`
+  6. real vs. imagined share the same label -> `mode` column is preserved so you can
+                                                 filter/stratify/model them separately
+  7. Row-random splitting leaks information -> each epoch is tagged with block/run so
+                                                 you can do group-aware CV (see bottom)
+
+Usage:
+    python preprocess_eeg.py \
+        --inputs JOEL_..._block_1_all_channels.csv JOEL2_..._block_2_all_channels.csv JOEL3_..._block_3_all_channels.csv \
+        --outdir ./processed
+
+Outputs (written to --outdir):
+    epochs_features.csv   One row per trial-segment (rest + task), with band-power
+                           features per channel. Use this for classical ML
+                           (logistic regression, SVM, CSP+LDA on top of raw epochs, etc).
+    epochs_raw.npz         Raw filtered epochs as a 3D array (n_epochs, n_channels,
+                           n_timepoints), aligned to a common length, for deep-learning
+                           models (EEGNet etc). Includes the same metadata as arrays.
+"""
 
 from __future__ import annotations
 
-import glob
-import os
+import argparse
+from dataclasses import dataclass
+from typing import cast
 
 import numpy as np
 import pandas as pd
-from scipy.signal import butter, sosfiltfilt
+from scipy.integrate import trapezoid
+from scipy.signal import butter, filtfilt, iirnotch, welch
+
+# --------------------------------------------------------------------------
+# Config (override via CLI flags where provided)
+# --------------------------------------------------------------------------
+
+# uniform resampling rate (Hz) -- matches the recorder's nominal rate
+TARGET_FS = 125.0
+BANDPASS = (1.0, 40.0)      # Hz; also removes the DC offset drift seen between blocks
+NOTCH_FREQ = 60.0           # Hz mains hum (use 50.0 outside North America)
+NOTCH_Q = 30.0
+# seconds from segment start to keep (ERD/ERS onset lags the cue)
+EPOCH_CROP = (0.5, 4.0)
+MU_BAND = (8.0, 12.0)
+BETA_BAND = (13.0, 30.0)
+CHANNEL_PREFIX = "ch"
+META_COLS = ["block", "run", "condition", "mode", "trial", "label"]
 
 
-RAW_DIR = "data/raw"
-OUTPUT_PATH = "data/processed/eeg_clean.csv"
-SAMPLE_RATE = 250
+@dataclass
+class Segment:
+    block: int
+    run: int
+    trial: int
+    condition: str
+    mode: str
+    label: str
+    t: np.ndarray          # (n_samples,) uniform timestamps, seconds, segment-relative
+    data: np.ndarray       # (n_channels, n_samples) filtered data
 
 
-def bandpass(values: np.ndarray, low: float = 1, high: float = 40,
-             fs: float = SAMPLE_RATE, order: int = 4) -> np.ndarray:
-    """Apply a numerically stable zero-phase bandpass to sample rows."""
-    if values.ndim != 2 or values.shape[1] == 0:
-        raise ValueError("EEG data must be a 2D array with at least one channel")
-    if not 0 < low < high < fs / 2:
-        raise ValueError("Cutoffs must satisfy 0 < low < high < Nyquist frequency")
-    sos = np.asarray(butter(order, [low, high], btype="bandpass", fs=fs, output="sos"))
-    # sosfiltfilt needs more samples than its padding length.
-    padlen = 3 * (2 * sos.shape[0] + 1)
-    if len(values) <= padlen:
-        raise ValueError(f"Session has {len(values)} samples; at least {padlen + 1} are required")
-    return sosfiltfilt(sos, values, axis=0)
+# --------------------------------------------------------------------------
+# Step 1: load + merge
+# --------------------------------------------------------------------------
+
+def load_and_merge(paths: list[str]) -> pd.DataFrame:
+    if not paths:
+        raise ValueError("At least one input CSV is required")
+    frames = []
+    for p in paths:
+        df = pd.read_csv(p)
+        required = {"timestamp", *META_COLS}
+        missing = required.difference(df.columns)
+        channels = channel_columns(df)
+        if missing or not channels:
+            details = f"missing columns: {sorted(missing)}" if missing else "no EEG channel columns"
+            raise ValueError(f"{p} has an invalid schema ({details})")
+        for col in ["timestamp", "block", "run", "trial", *channels]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        if df[["timestamp", "block", "run", "trial", *channels]].isna().any().any():
+            raise ValueError(
+                f"{p} contains missing or non-numeric timestamps, metadata, or EEG samples")
+        if not np.isfinite(df[["timestamp", *channels]].to_numpy(dtype=float)).all():
+            raise ValueError(f"{p} contains non-finite timestamps or EEG samples")
+        frames.append(df)
+    expected_channels = channel_columns(frames[0])
+    for path, frame in zip(paths[1:], frames[1:]):
+        if channel_columns(frame) != expected_channels:
+            raise ValueError(
+                f"{path} has EEG channels that do not match the first input")
+    merged = pd.concat(frames, ignore_index=True)
+    merged = merged.sort_values(["block", "timestamp"]).reset_index(drop=True)
+    return merged
 
 
-def main() -> None:
-    print("Loading session data...")
-    file_paths = sorted(
-        path for path in glob.glob(os.path.join(RAW_DIR, "*.csv"))
-        if not path.endswith("_channels_3_4_5.csv")
+def channel_columns(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if c.startswith(CHANNEL_PREFIX)]
+
+
+# --------------------------------------------------------------------------
+# Step 2: resample each (block, run) onto a uniform time grid
+# --------------------------------------------------------------------------
+
+def resample_run(run_df: pd.DataFrame, ch_cols: list[str], target_fs: float) -> pd.DataFrame:
+    run_df = run_df.sort_values("timestamp")
+    old_t = run_df["timestamp"].to_numpy(dtype=np.float64)
+    if len(old_t) < 2:
+        return run_df.iloc[0:0]
+
+    n_samples = int(np.floor((old_t[-1] - old_t[0]) * target_fs)) + 1
+    new_t = old_t[0] + np.arange(n_samples) / target_fs
+
+    out = {"timestamp": new_t}
+    for ch in ch_cols:
+        values = run_df[ch].to_numpy(dtype=np.float64)
+        out[ch] = np.interp(new_t, old_t, values)
+
+    # Nearest-neighbor carry-over for categorical/metadata columns (they are
+    # piecewise-constant between trial/label boundaries, so nearest-sample
+    # assignment is exact away from the transition instant).
+    idx = np.searchsorted(old_t, new_t, side="right") - 1
+    idx = np.asarray(np.clip(idx, 0, len(old_t) - 1), dtype=np.intp)
+    for col in ["block", "run", "condition", "mode", "trial", "label"]:
+        out[col] = run_df[col].to_numpy()[idx]
+
+    return pd.DataFrame(out)
+
+
+def resample_all(df: pd.DataFrame, ch_cols: list[str], target_fs: float) -> pd.DataFrame:
+    pieces = []
+    for (block, run), g in df.groupby(["block", "run"], sort=False):
+        pieces.append(resample_run(g, ch_cols, target_fs))
+    nonempty = [piece for piece in pieces if not piece.empty]
+    return pd.concat(nonempty, ignore_index=True) if nonempty else df.iloc[0:0].copy()
+
+
+# --------------------------------------------------------------------------
+# Step 3: filter (band-pass removes DC offset/drift, notch removes mains hum)
+# --------------------------------------------------------------------------
+
+def design_filters(
+    fs: float, notch_freq: float,
+) -> tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray] | None]:
+    if not np.isfinite(fs) or fs <= 2 * BANDPASS[0]:
+        raise ValueError(f"Sampling rate must be greater than {2 * BANDPASS[0]} Hz")
+    nyq = fs / 2.0
+    low, high = BANDPASS
+    high = min(high, nyq - 1.0)  # keep below Nyquist
+    if high <= low:
+        raise ValueError(
+            f"Sampling rate {fs} Hz is too low for the {BANDPASS[0]}-{BANDPASS[1]} Hz band-pass")
+    if not np.isfinite(notch_freq) or notch_freq <= 0:
+        raise ValueError("Notch frequency must be positive and finite")
+    bandpass_coefficients = cast(
+        tuple[np.ndarray, np.ndarray],
+        butter(4, [low / nyq, high / nyq], btype="band"),
     )
-    if not file_paths:
-        raise FileNotFoundError(f"No CSV files found in {RAW_DIR}/")
+    b_bp, a_bp = bandpass_coefficients
+    notch = (
+        cast(tuple[np.ndarray, np.ndarray], iirnotch(notch_freq / nyq, NOTCH_Q))
+        if notch_freq < nyq
+        else None
+    )
+    return (b_bp, a_bp), notch
 
-    sessions = []
-    expected_channels = None
-    for path in file_paths:
-        print(f"Loading {path}")
-        frame = pd.read_csv(path)
-        channel_names = [name for name in frame.columns if name.startswith("ch")]
-        if "label" not in frame or not channel_names:
-            raise ValueError(f"{path} must contain EEG channel columns and a label column")
-        if expected_channels is None:
-            expected_channels = channel_names
-        elif channel_names != expected_channels:
-            raise ValueError(f"EEG channels in {path} do not match the other sessions")
-        samples = frame[channel_names].apply(pd.to_numeric, errors="coerce")
-        if samples.isna().any().any():
-            raise ValueError(f"{path} contains missing or non-numeric EEG samples")
-        if frame["label"].isna().any():
-            raise ValueError(f"{path} contains missing labels")
-        # Filter each run independently so filtering never crosses run boundaries.
-        run_groups = frame.groupby("run", sort=False) if "run" in frame else [(None, frame)]
-        for _, run in run_groups:
-            run_samples = run[channel_names].apply(pd.to_numeric, errors="coerce")
-            if run_samples.isna().any().any() or run["label"].isna().any():
-                raise ValueError(f"{path} contains missing or non-numeric EEG values")
-            filtered = bandpass(run_samples.to_numpy(dtype=float))
-            clean = pd.DataFrame(filtered, columns=channel_names)
-            clean["label"] = run["label"].to_numpy()
-            sessions.append(clean)
 
-    data = pd.concat(sessions, ignore_index=True)
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    data.to_csv(OUTPUT_PATH, index=False)
-    print(f"Total samples loaded: {len(data)}")
-    print(f"Clean data saved to: {OUTPUT_PATH}")
+def filter_run(data: np.ndarray, fs: float, notch_freq: float) -> np.ndarray:
+    """data: (n_channels, n_samples). Zero-phase filtering per run to avoid
+    smearing artifacts across the (unrelated) gap between recording runs."""
+    (b_bp, a_bp), notch = design_filters(fs, notch_freq)
+    n_samples = data.shape[1]
+    min_len = 3 * (max(a_bp.size, b_bp.size) - 1)
+    if n_samples <= min_len:
+        return data  # too short to filtfilt safely; leave as-is
+    out = filtfilt(b_bp, a_bp, data, axis=1)
+    if notch is not None:
+        b_notch, a_notch = notch
+        out = filtfilt(b_notch, a_notch, out, axis=1)
+    return out
+
+
+def filter_all(resampled: pd.DataFrame, ch_cols: list[str], fs: float, notch_freq: float) -> pd.DataFrame:
+    filtered_frames = []
+    for (block, run), g in resampled.groupby(["block", "run"], sort=False):
+        data = g[ch_cols].to_numpy(dtype=np.float64).T  # (n_channels, n_samples)
+        filtered = filter_run(data, fs, notch_freq)
+        g = g.copy()
+        g[ch_cols] = filtered.T
+        filtered_frames.append(g)
+    return pd.concat(filtered_frames, ignore_index=True)
+
+
+# --------------------------------------------------------------------------
+# Step 4: epoch into trial-segments (one rest + one task segment per trial)
+# --------------------------------------------------------------------------
+
+def extract_segments(filtered: pd.DataFrame, ch_cols: list[str], fs: float) -> list[Segment]:
+    segments: list[Segment] = []
+    for (block, run), g in filtered.groupby(["block", "run"], sort=False):
+        g = g.reset_index(drop=True)
+        # contiguous runs of identical label = one segment (rest run, or one
+        # rest/task half of a trial pair)
+        seg_id = (g["label"] != g["label"].shift()).cumsum()
+        for _, seg in g.groupby(seg_id):
+            timestamps = seg["timestamp"].to_numpy(dtype=np.float64)
+            t0 = timestamps[0]
+            t_rel = timestamps - t0
+            data = seg[ch_cols].to_numpy(dtype=np.float64).T
+            segments.append(
+                Segment(
+                    block=int(seg["block"].iloc[0]),
+                    run=int(seg["run"].iloc[0]),
+                    trial=int(seg["trial"].iloc[0]),
+                    condition=str(seg["condition"].iloc[0]),
+                    mode=str(seg["mode"].iloc[0]),
+                    label=str(seg["label"].iloc[0]),
+                    t=t_rel,
+                    data=data,
+                )
+            )
+    return segments
+
+
+def crop_segment(seg: Segment, fs: float, crop: tuple[float, float]) -> Segment | None:
+    start, end = crop
+    mask = (seg.t >= start) & (seg.t < end)
+    if mask.sum() < int(0.5 * fs):  # need at least ~0.5s of data to be usable
+        return None
+    return Segment(
+        block=seg.block, run=seg.run, trial=seg.trial, condition=seg.condition,
+        mode=seg.mode, label=seg.label, t=seg.t[mask] - start, data=seg.data[:, mask],
+    )
+
+
+# --------------------------------------------------------------------------
+# Step 5a: band-power features (for classical ML)
+# --------------------------------------------------------------------------
+
+def band_power(sig: np.ndarray, fs: float, band: tuple[float, float]) -> float:
+    freqs, psd = welch(sig, fs=fs, nperseg=min(len(sig), int(fs)))
+    mask = (freqs >= band[0]) & (freqs <= band[1])
+    if not mask.any():
+        return 0.0
+    return float(trapezoid(psd[mask], freqs[mask]))
+
+
+def segment_features(seg: Segment, fs: float, ch_cols: list[str]) -> dict:
+    feats = {
+        "block": seg.block, "run": seg.run, "trial": seg.trial,
+        "condition": seg.condition, "mode": seg.mode, "label": seg.label,
+        "n_samples": seg.data.shape[1],
+    }
+    for i, ch in enumerate(ch_cols):
+        sig = seg.data[i]
+        mu = band_power(sig, fs, MU_BAND)
+        beta = band_power(sig, fs, BETA_BAND)
+        # log-transform band power: standard in EEG ML, makes it closer to normal
+        feats[f"{ch}_mu_logpower"] = np.log1p(mu)
+        feats[f"{ch}_beta_logpower"] = np.log1p(beta)
+    return feats
+
+
+# --------------------------------------------------------------------------
+# Step 5b: raw epoch array (for deep learning)
+# --------------------------------------------------------------------------
+
+def segments_to_array(segments: list[Segment], ch_cols: list[str]):
+    if not segments:
+        return np.empty((0, len(ch_cols), 0), dtype=np.float32), {
+            "block": [], "run": [], "trial": [], "condition": [], "mode": [], "label": [],
+        }
+    lengths = [s.data.shape[1] for s in segments]
+    common_len = int(np.median(lengths))  # trim/pad to a common length
+    n_ch = len(ch_cols)
+    arr = np.zeros((len(segments), n_ch, common_len), dtype=np.float32)
+    meta = {"block": [], "run": [], "trial": [],
+            "condition": [], "mode": [], "label": []}
+    for i, s in enumerate(segments):
+        L = s.data.shape[1]
+        if L >= common_len:
+            arr[i] = s.data[:, :common_len]
+        else:
+            arr[i, :, :L] = s.data
+        meta["block"].append(s.block)
+        meta["run"].append(s.run)
+        meta["trial"].append(s.trial)
+        meta["condition"].append(s.condition)
+        meta["mode"].append(s.mode)
+        meta["label"].append(s.label)
+    return arr, meta
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--inputs", nargs="+", required=True,
+                        help="raw *_all_channels.csv files, one per block")
+    parser.add_argument("--outdir", default="./processed", help="output directory")
+    parser.add_argument("--fs", type=float, default=TARGET_FS,
+                        help="target resampling rate (Hz)")
+    parser.add_argument("--notch", type=float, default=NOTCH_FREQ,
+                        help="mains notch frequency (Hz); use 50 outside NA")
+    parser.add_argument("--crop-start", type=float,
+                        default=EPOCH_CROP[0], help="seconds into each segment to start keeping data")
+    parser.add_argument("--crop-end", type=float,
+                        default=EPOCH_CROP[1], help="seconds into each segment to stop keeping data")
+    parser.add_argument("--drop-rest", action="store_true",
+                        help="drop rest epochs from the output (keep only the 4 movement classes)")
+    args = parser.parse_args()
+
+    notch_freq = args.notch
+    crop = (args.crop_start, args.crop_end)
+    fs = args.fs
+
+    if not np.isfinite(fs) or fs <= 0:
+        parser.error("--fs must be a positive finite number")
+    if not np.isfinite(notch_freq) or notch_freq <= 0:
+        parser.error("--notch must be a positive finite number")
+    if not (np.isfinite(crop[0]) and np.isfinite(crop[1]) and 0 <= crop[0] < crop[1]):
+        parser.error(
+            "crop bounds must be finite and satisfy 0 <= --crop-start < --crop-end")
+
+    import os
+    os.makedirs(args.outdir, exist_ok=True)
+
+    print(f"Loading {len(args.inputs)} file(s)...")
+    df = load_and_merge(args.inputs)
+    ch_cols = channel_columns(df)
+    print(
+        f"  {len(df)} raw rows, {len(ch_cols)} channels, blocks: {sorted(df['block'].unique())}")
+
+    print(f"Resampling to a uniform {fs} Hz grid per (block, run)...")
+    resampled = resample_all(df, ch_cols, fs)
+    print(f"  {len(resampled)} rows after resampling")
+
+    print(f"Filtering: band-pass {BANDPASS} Hz, notch {notch_freq} Hz...")
+    filtered = filter_all(resampled, ch_cols, fs, notch_freq)
+
+    print("Epoching into trial-segments...")
+    segments = extract_segments(filtered, ch_cols, fs)
+    print(f"  {len(segments)} raw segments (rest + task, all trials + baselines)")
+
+    cropped = [crop_segment(s, fs, crop) for s in segments]
+    cropped = [s for s in cropped if s is not None]
+    print(f"  {len(cropped)} segments after cropping to {crop[0]}-{crop[1]}s window")
+
+    if args.drop_rest:
+        cropped = [s for s in cropped if s.label != "rest"]
+        print(f"  {len(cropped)} segments after dropping rest")
+
+    # ---- features table (classical ML) ----
+    print("Extracting band-power features...")
+    feat_rows = [segment_features(s, fs, ch_cols) for s in cropped]
+    feat_df = pd.DataFrame(feat_rows)
+    feat_path = f"{args.outdir}/epochs_features.csv"
+    feat_df.to_csv(feat_path, index=False)
+    print(f"  wrote {feat_path}  ({feat_df.shape[0]} rows x {feat_df.shape[1]} cols)")
+
+    # ---- raw epoch array (deep learning) ----
+    print("Building raw epoch array...")
+    arr, meta = segments_to_array(cropped, ch_cols)
+    npz_path = f"{args.outdir}/epochs_raw.npz"
+    np.savez_compressed(
+        npz_path,
+        data=arr,
+        channels=np.asarray(ch_cols),
+        block=np.asarray(meta["block"]),
+        run=np.asarray(meta["run"]),
+        trial=np.asarray(meta["trial"]),
+        condition=np.asarray(meta["condition"]),
+        mode=np.asarray(meta["mode"]),
+        label=np.asarray(meta["label"]),
+    )
+    print(
+        f"  wrote {npz_path}  (array shape {arr.shape} = [epochs, channels, timepoints])")
+
+    print("\nLabel counts in final output:")
+    print(feat_df["label"].value_counts() if "label" in feat_df else "No usable epochs")
+    print("\nmode breakdown (real vs imagined):")
+    print(feat_df.groupby(["mode", "label"]).size()
+          if not feat_df.empty else "No usable epochs")
+
+    print(
+        "\nReminder: split train/test by `block` (or `run`), not by random row, "
+        "to avoid leakage between temporally adjacent epochs -- e.g. GroupKFold "
+        "on the `block` or `run` column in epochs_features.csv."
+    )
 
 
 if __name__ == "__main__":
